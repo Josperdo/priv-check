@@ -1,4 +1,4 @@
-# Local Privilege Group Auditor
+# priv-check
 
 A PowerShell script that audits local privileged group memberships on Windows machines. Designed for security analysts who need to quickly identify who has elevated access and flag potentially stale accounts.
 
