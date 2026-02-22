@@ -63,8 +63,22 @@ function Get-TargetGroupMembers {
         [string]$GroupName
     )
 
-    # Consider: What happens if the group doesn't exist on this machine?
-    # Consider: What happens with orphaned/unresolvable SIDs?
+    try {
+        $null = Get-LocalGroup -Name $GroupName -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Group '$GroupName' not found on this system. Skipping."
+        return @()
+    }
+
+    try {
+        return @(Get-LocalGroupMember -Name $GroupName -ErrorAction Stop)
+    }
+    catch {
+        # Get-LocalGroupMember has a known issue with orphaned/unresolvable SIDs
+        Write-Warning "Could not fully enumerate '$GroupName': $($_.Exception.Message)"
+        return @()
+    }
 }
 
 function Get-MemberDetail {
@@ -75,6 +89,8 @@ function Get-MemberDetail {
         A member object returned from Get-TargetGroupMembers.
     .PARAMETER GroupName
         The group this member belongs to.
+    .PARAMETER StaleDaysThreshold
+        Number of days without logon before an account is considered stale.
     .OUTPUTS
         PSCustomObject with: GroupName, Username, AccountType, Enabled, LastLogon, IsStale
     #>
@@ -84,12 +100,45 @@ function Get-MemberDetail {
         $Member,
 
         [Parameter(Mandatory)]
-        [string]$GroupName
+        [string]$GroupName,
+
+        [Parameter(Mandatory)]
+        [int]$StaleDaysThreshold
     )
 
+    $enabled   = $null
+    $lastLogon = $null
+    $isStale   = $null
 
-    # Add domain accounts won't have local user details
-    # Consider: What makes an account "stale"?
+    if ($Member.PrincipalSource -eq 'Local') {
+        # Strip the COMPUTERNAME\ prefix to get the bare username for Get-LocalUser
+        $localUsername = ($Member.Name -split '\\')[-1]
+        try {
+            $localUser = Get-LocalUser -Name $localUsername -ErrorAction Stop
+            $enabled   = $localUser.Enabled
+            $lastLogon = $localUser.LastLogon  # $null means never logged on locally
+
+            $isStale = if ($null -eq $lastLogon) {
+                $true  # Never logged on — treat as stale
+            } else {
+                ((Get-Date) - $lastLogon).Days -gt $StaleDaysThreshold
+            }
+        }
+        catch {
+            Write-Warning "Could not retrieve details for local user '$localUsername': $($_.Exception.Message)"
+        }
+    }
+    # Domain/Azure accounts: local machine does not store their enabled status or logon history.
+    # Enabled, LastLogon, and IsStale remain $null to signal indeterminate.
+
+    [PSCustomObject]@{
+        GroupName   = $GroupName
+        Username    = $Member.Name
+        AccountType = $Member.PrincipalSource
+        Enabled     = if ($null -ne $enabled) { $enabled } else { 'N/A' }
+        LastLogon   = if ($null -ne $lastLogon) { $lastLogon.ToString('yyyy-MM-dd HH:mm:ss') } elseif ($Member.PrincipalSource -eq 'Local') { 'Never' } else { 'N/A (Domain)' }
+        IsStale     = if ($null -ne $isStale) { $isStale } else { 'N/A' }
+    }
 }
 
 function Export-AuditResults {
@@ -110,13 +159,52 @@ function Export-AuditResults {
         [string]$Path
     )
 
-    # Export-Csv
-    # Consider: What if the output directory doesn't exist?
+    $outputDir = Split-Path -Path $Path -Parent
+    if ($outputDir -and (-not (Test-Path -Path $outputDir))) {
+        Write-Verbose "Creating output directory: $outputDir"
+        New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+    }
+
+    $Results | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+    Write-Verbose "Results exported to: $Path"
 }
 
 # --- Main Execution ---
+
 # 1. Set default output path if not provided
-# 2. Loop through $TargetGroups
-# 3. For each group, get members and collect details
-# 4. Export all results
-# 5. Write a summary to the console
+if (-not $OutputPath) {
+    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $OutputPath = Join-Path -Path $PSScriptRoot -ChildPath "output\PrivilegeAudit_$timestamp.csv"
+}
+
+# 2. Loop through target groups and collect member details
+$allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
+
+foreach ($group in $TargetGroups) {
+    Write-Verbose "Auditing group: $group"
+    $members = Get-TargetGroupMembers -GroupName $group
+
+    foreach ($member in $members) {
+        $detail = Get-MemberDetail -Member $member -GroupName $group -StaleDaysThreshold $StaleDays
+        $allResults.Add($detail)
+    }
+}
+
+# 3. Export results and print summary
+if ($allResults.Count -gt 0) {
+    Export-AuditResults -Results $allResults.ToArray() -Path $OutputPath
+
+    # 4. Console summary
+    $staleCount = ($allResults | Where-Object { $_.IsStale -eq $true }).Count
+    $totalCount = $allResults.Count
+
+    Write-Host "`n=== Privilege Audit Summary ===" -ForegroundColor Cyan
+    Write-Host "Groups audited   : $($TargetGroups.Count)"
+    Write-Host "Accounts found   : $totalCount"
+    Write-Host "Stale accounts   : $staleCount" -ForegroundColor $(if ($staleCount -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Host "Stale threshold  : $StaleDays days"
+    Write-Host "Report saved to  : $OutputPath`n"
+}
+else {
+    Write-Warning "No members found across all target groups. No CSV generated."
+}
