@@ -106,9 +106,10 @@ function Get-MemberDetail {
         [int]$StaleDaysThreshold
     )
 
-    $enabled   = $null
-    $lastLogon = $null
-    $isStale   = $null
+    $enabled      = $null
+    $lastLogon    = $null
+    $isStale      = $null
+    $lookupFailed = $false
 
     if ($Member.PrincipalSource -eq 'Local') {
         # Strip the COMPUTERNAME\ prefix to get the bare username for Get-LocalUser
@@ -125,20 +126,68 @@ function Get-MemberDetail {
             }
         }
         catch {
+            $lookupFailed = $true
             Write-Warning "Could not retrieve details for local user '$localUsername': $($_.Exception.Message)"
         }
     }
     # Domain/Azure accounts: local machine does not store their enabled status or logon history.
     # Enabled, LastLogon, and IsStale remain $null to signal indeterminate.
 
+    $lastLogonDisplay = if ($null -ne $lastLogon) {
+        $lastLogon.ToString('yyyy-MM-dd HH:mm:ss')
+    } elseif ($lookupFailed) {
+        'N/A (error)'
+    } elseif ($Member.PrincipalSource -eq 'Local') {
+        'Never'
+    } else {
+        'N/A (Domain)'
+    }
+
     [PSCustomObject]@{
         GroupName   = $GroupName
         Username    = $Member.Name
         AccountType = $Member.PrincipalSource
         Enabled     = if ($null -ne $enabled) { $enabled } else { 'N/A' }
-        LastLogon   = if ($null -ne $lastLogon) { $lastLogon.ToString('yyyy-MM-dd HH:mm:ss') } elseif ($Member.PrincipalSource -eq 'Local') { 'Never' } else { 'N/A (Domain)' }
+        LastLogon   = $lastLogonDisplay
         IsStale     = if ($null -ne $isStale) { $isStale } else { 'N/A' }
     }
+}
+
+function Write-ColorTable {
+    <#
+    .SYNOPSIS
+        Prints audit results as a color-coded console table.
+    .PARAMETER Results
+        Array of audit result objects to display.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [array]$Results
+    )
+
+    $header = '{0,-25} {1,-22} {2,-10} {3,-8} {4,-22} {5}' -f 'Username', 'Group', 'Type', 'Enabled', 'Last Logon', 'Stale'
+    $divider = '-' * $header.Length
+
+    Write-Host "`n$header" -ForegroundColor White
+    Write-Host $divider -ForegroundColor DarkGray
+
+    foreach ($row in $Results) {
+        $line = '{0,-25} {1,-22} {2,-10} {3,-8} {4,-22} {5}' -f `
+            $row.Username, $row.GroupName, $row.AccountType, $row.Enabled, $row.LastLogon, $row.IsStale
+
+        $color = if ($row.IsStale -eq $true) {
+            'Red'
+        } elseif ($row.IsStale -eq $false) {
+            'Green'
+        } else {
+            'DarkGray'  # N/A (domain accounts)
+        }
+
+        Write-Host $line -ForegroundColor $color
+    }
+
+    Write-Host $divider -ForegroundColor DarkGray
 }
 
 function Export-AuditResults {
@@ -171,13 +220,20 @@ function Export-AuditResults {
 
 # --- Main Execution ---
 
-# 1. Set default output path if not provided
-if (-not $OutputPath) {
-    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
-    $OutputPath = Join-Path -Path $PSScriptRoot -ChildPath "output\PrivilegeAudit_$timestamp.csv"
+# 1. Guard: nothing to do if no groups are configured
+if ($TargetGroups.Count -eq 0) {
+    Write-Warning "No target groups configured. Add group names to `$TargetGroups and re-run."
+    return
 }
 
-# 2. Loop through target groups and collect member details
+# 2. Set default output path if not provided
+$scriptRoot = if ($PSScriptRoot) { $PSScriptRoot } else { $PWD.Path }
+if (-not $OutputPath) {
+    $timestamp  = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $OutputPath = Join-Path -Path $scriptRoot -ChildPath "output\PrivilegeAudit_$timestamp.csv"
+}
+
+# 3. Loop through target groups and collect member details
 $allResults = [System.Collections.Generic.List[PSCustomObject]]::new()
 
 foreach ($group in $TargetGroups) {
@@ -190,18 +246,26 @@ foreach ($group in $TargetGroups) {
     }
 }
 
-# 3. Export results and print summary
+# 4. Export results and print summary
 if ($allResults.Count -gt 0) {
-    Export-AuditResults -Results $allResults.ToArray() -Path $OutputPath
+    $resultsArray = $allResults.ToArray()
+    Export-AuditResults -Results $resultsArray -Path $OutputPath
 
-    # 4. Console summary
-    $staleCount = ($allResults | Where-Object { $_.IsStale -eq $true }).Count
-    $totalCount = $allResults.Count
+    # 5. Color-coded console table
+    Write-ColorTable -Results $resultsArray
+
+    # 6. Summary block
+    $staleCount    = ($resultsArray | Where-Object { $_.IsStale -eq $true }).Count
+    $healthyCount  = ($resultsArray | Where-Object { $_.IsStale -eq $false }).Count
+    $unknownCount  = ($resultsArray | Where-Object { $_.IsStale -eq 'N/A' }).Count
+    $totalCount    = $resultsArray.Count
 
     Write-Host "`n=== Privilege Audit Summary ===" -ForegroundColor Cyan
     Write-Host "Groups audited   : $($TargetGroups.Count)"
     Write-Host "Accounts found   : $totalCount"
-    Write-Host "Stale accounts   : $staleCount" -ForegroundColor $(if ($staleCount -gt 0) { 'Yellow' } else { 'Green' })
+    Write-Host "  Healthy        : $healthyCount" -ForegroundColor Green
+    Write-Host "  Stale          : $staleCount"   -ForegroundColor $(if ($staleCount -gt 0) { 'Red' } else { 'Green' })
+    Write-Host "  Unknown (domain): $unknownCount" -ForegroundColor DarkGray
     Write-Host "Stale threshold  : $StaleDays days"
     Write-Host "Report saved to  : $OutputPath`n"
 }
