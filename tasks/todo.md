@@ -13,7 +13,7 @@
 
 ## Backlog
 
-- [ ] Add HTML report export option
-- [ ] Support auditing remote machines via `-ComputerName`
-- [ ] Add `-GroupName` parameter to override default target groups at runtime
-- [ ] Pester unit tests for `Get-MemberDetail` logic
+- [x] Add HTML report export option (`-HtmlReport` switch, dark-themed self-contained HTML)
+- [x] Support auditing remote machines via `-ComputerName` (+ optional `-Credential`)
+- [x] Add `-GroupName` parameter to override default target groups at runtime
+- [x] Pester unit tests for `Get-MemberDetail` and `Get-TargetGroupMembers`
